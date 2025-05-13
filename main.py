@@ -15,6 +15,10 @@ from typing import Optional
 # Cargar variables de entorno
 load_dotenv()
 
+# Verificar API key de Groq
+if not os.getenv("GROQ_API_KEY"):
+    raise ValueError("❌ No se encontró GROQ_API_KEY en el archivo .env")
+
 app = FastAPI()
 
 # CORS para aceptar requests desde frontend
@@ -28,6 +32,13 @@ app.add_middleware(
 @app.post("/upload")
 async def upload_audio(file: UploadFile = File(...)):
     try:
+        # Verificar tipo de archivo
+        if not file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.ogg')):
+            raise HTTPException(
+                status_code=400,
+                detail="Formato de archivo no soportado. Use .wav, .mp3, .m4a o .ogg"
+            )
+        
         # Crear directorios necesarios
         os.makedirs("temp", exist_ok=True)
         os.makedirs("transcripts", exist_ok=True)
@@ -36,56 +47,63 @@ async def upload_audio(file: UploadFile = File(...)):
         
         # Guardar el archivo de audio temporalmente
         temp_audio_path = os.path.join("temp", file.filename)
-        with open(temp_audio_path, "wb") as buffer:
-            audio_bytes = await file.read()
-            buffer.write(audio_bytes)
+        try:
+            with open(temp_audio_path, "wb") as buffer:
+                audio_bytes = await file.read()
+                buffer.write(audio_bytes)
+            
+            # Transcribir el audio usando Groq API
+            texto_transcrito = transcribe_audio(temp_audio_path)
+            
+            # Procesar el texto y construir RAG
+            transcript_path = os.path.join("transcripts", os.path.basename(temp_audio_path).rsplit(".", 1)[0] + ".txt")
+            frases_utiles = cargar_frases_utiles(transcript_path)
+            documentos = construir_chunks(frases_utiles)
+            vectorizar_y_guardar(documentos)
+            
+            # Detectar temática
+            embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+            texto_representativo = detectar_texto_representativo(frases_utiles, embeddings_model)
+            
+            # Guardar temática detectada
+            with open("outputs/tematica_detectada.txt", "w", encoding="utf-8") as f:
+                f.write(texto_representativo)
+            
+            # Generar informe inicial
+            vectorstore = cargar_base_vectorial()
+            contexto = recuperar_contexto(vectorstore)
+            informe = generar_informe(contexto, texto_representativo)
+            
+            # Guardar informe
+            with open("outputs/informe_tecnico.txt", "w", encoding="utf-8") as f:
+                f.write(informe)
+            
+            # Revisar informe
+            revision = revisar_informe_como_especialista(informe, texto_representativo)
+            
+            # Guardar revisión
+            with open("outputs/revision_informe.txt", "w", encoding="utf-8") as f:
+                f.write(revision)
+            
+            return {
+                "message": "Procesamiento completado exitosamente",
+                "transcripcion": texto_transcrito,
+                "informe": informe,
+                "revision": revision,
+                "tematica": texto_representativo
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            # Limpiar archivo temporal incluso si hay error
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
         
-        # Transcribir el audio
-        texto_transcrito = transcribe_audio(temp_audio_path)
-        
-        # Procesar el texto y construir RAG
-        transcript_path = os.path.join("transcripts", os.path.basename(temp_audio_path).rsplit(".", 1)[0] + ".txt")
-        frases_utiles = cargar_frases_utiles(transcript_path)
-        documentos = construir_chunks(frases_utiles)
-        vectorizar_y_guardar(documentos)
-        
-        # Detectar temática
-        embeddings_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        texto_representativo = detectar_texto_representativo(frases_utiles, embeddings_model)
-        
-        # Guardar temática detectada
-        with open("outputs/tematica_detectada.txt", "w", encoding="utf-8") as f:
-            f.write(texto_representativo)
-        
-        # Generar informe inicial
-        vectorstore = cargar_base_vectorial()
-        contexto = recuperar_contexto(vectorstore)
-        informe = generar_informe(contexto, texto_representativo)
-        
-        # Guardar informe
-        with open("outputs/informe_tecnico.txt", "w", encoding="utf-8") as f:
-            f.write(informe)
-        
-        # Revisar informe
-        revision = revisar_informe_como_especialista(informe, texto_representativo)
-        
-        # Guardar revisión
-        with open("outputs/revision_informe.txt", "w", encoding="utf-8") as f:
-            f.write(revision)
-        
-        # Limpiar archivo temporal
-        os.remove(temp_audio_path)
-        
-        return {
-            "message": "Procesamiento completado exitosamente",
-            "transcripcion": texto_transcrito,
-            "informe": informe,
-            "revision": revision,
-            "tematica": texto_representativo
-        }
-        
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error inesperado: {str(e)}")
 
 @app.post("/query")
 async def query_transcription(query: str = Body(..., embed=True)):
