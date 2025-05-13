@@ -1,1 +1,0 @@
-# CLI o interfaz principal
